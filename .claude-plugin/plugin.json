@@ -16,7 +16,7 @@
     "keep_display_on": {
       "type": "boolean",
       "title": "Keep the display on too",
-      "description": "Also keep the monitor lit while Claude works, not just the system awake. Does NOT prevent the lock screen. Default: off (the screen may still dim/turn off).",
+      "description": "Windows/WSL2 only: also keep the monitor lit, not just the system awake -- it does NOT prevent the lock screen. No effect on Linux, where the idle inhibition already covers the display. Default: off (on Windows the screen may still dim/turn off).",
       "default": false
     },
     "max_lifetime_hours": {

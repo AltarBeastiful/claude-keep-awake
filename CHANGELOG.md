@@ -3,6 +3,46 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Linux (bare metal) support.** `planHolder()` now returns a real holder on `linux`: a
+  detached `systemd-inhibit --what=idle --mode=block` wrapping the max-lifetime backstop. If
+  `systemd-inhibit` is absent it falls back to `elogind-inhibit` (Void, Artix, Gentoo OpenRC,
+  Devuan, Alpine; identical CLI) and then to `gnome-session-inhibit`; with none installed the
+  behaviour is the previous benign no-op. Verified live on Plasma 6 / Wayland: the inhibition
+  reaches PowerDevil, and `/keep-awake-status` shows the clean `False -> True -> False`
+  differential across a turn.
+- **Linux `status` probe.** `/keep-awake-status` reports the resolved backend, how many idle
+  inhibitors Claude currently holds, and a `System sleep blocked` verdict parsed from
+  `systemd-inhibit --list`.
+- **`tests/node/linux.test.mjs`**: argv assertions for every backend and option permutation,
+  absent-binary fallback, backstop arithmetic, `--list` and `/proc` parsing. Plus one
+  integration test that launches a real inhibitor and confirms the group kill releases it; it
+  skips itself when no systemd/elogind binary is present.
+
+### Changed
+- **`keep_display_on`'s config-dialog description is now platform-accurate.** It previously
+  read "Also keep the monitor lit ... the screen may still dim/turn off" on every platform,
+  which is wrong on Linux: the idle inhibition already covers the display, so the toggle
+  changes nothing there. `README.md` already said so; only `plugin.json` -- the text users
+  actually see in `/plugin` -- was stale. Wording only; no behaviour change.
+
+### Notes
+- The inhibition is **`idle`, never `sleep`**, which is the same inhibition a media player
+  holds while playing. It blocks idle sleep and screen blanking, and leaves every deliberate
+  suspend path working: `systemctl suspend`, the power menu, and closing the lid all still
+  suspend the machine. `--what=sleep --mode=block` would take those away, leaving a laptop
+  running hot in a bag. Plasma's battery applet names the difference directly: an `idle`
+  inhibition reads "is blocking screen locking", a `sleep:idle` one reads "is blocking sleep
+  and screen locking".
+- `keep_display_on` is not a separate lever on Linux: an idle inhibition already covers
+  display-off, and on Plasma it suppresses the screen lock too. The option still tags the
+  reason string shown by `systemd-inhibit --list`.
+- PID-reuse safety uses field 22 of `/proc/<pid>/stat` as the identity, and `unblock` signals
+  the process **group**: `systemd-inhibit` runs the backstop as a child, which killing the
+  leader alone would strand.
+
 ## [1.2.0] - 2026-06-14
 
 Cross-platform release. The plugin is no longer Windows-only: a single Node dispatcher backs

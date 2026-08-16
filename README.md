@@ -15,11 +15,11 @@ finishing never lets another window's machine sleep.
 |----------|--------|-----------|
 | **Windows** | ✅ Implemented | `PowerSetRequest(PowerRequestSystemRequired)` held by a detached `powershell.exe` |
 | **WSL2** (on Windows) | ✅ Implemented | Delegates to the **Windows host** over interop (a keep-awake *inside* WSL2 can't stop the host sleeping) |
+| **Linux** (bare metal) | ✅ Implemented | A detached `systemd-inhibit` (or `elogind-inhibit`, or `gnome-session-inhibit`) holding an **idle** inhibition |
 | **macOS** | ⏳ Detected, no-op | Reserved for `caffeinate` — contributions welcome |
-| **Linux** (bare metal) | ⏳ Detected, no-op | Reserved for `systemd-inhibit` — contributions welcome |
 
-On macOS and bare-metal Linux the plugin detects the OS and exits cleanly (a harmless
-no-op), so it is safe to install anywhere.
+On macOS, and on Linux with none of the three inhibit binaries installed, the plugin detects
+the environment and exits cleanly (a harmless no-op), so it is safe to install anywhere.
 
 ### Requirements
 
@@ -62,14 +62,42 @@ the *same* `powershell.exe` holder on the host, captures the host's real PID, an
 terminates it by PID (`Stop-Process` over interop). If interop is disabled, it degrades to a
 benign no-op.
 
+**Linux.** The holder is a detached
+[`systemd-inhibit`](https://www.freedesktop.org/software/systemd/man/systemd-inhibit.html)
+holding `--what=idle --mode=block`, which is what every desktop idle timer consults (logind's
+own `IdleAction`, KDE PowerDevil, GNOME). If `systemd-inhibit` is absent the dispatcher falls
+back to `elogind-inhibit` (Void, Artix, Gentoo OpenRC, Devuan, Alpine; same CLI) and then to
+`gnome-session-inhibit`; with none of them installed it is a benign no-op.
+
+**It inhibits `idle`, never `sleep`**, and on Linux that distinction is the whole design. It is
+the same inhibition a media player holds while playing, so the behaviour is the one you already
+know from watching a video:
+
+| `--what=` | Idle sleep | Screen lock / blank | `systemctl suspend` | Closing the lid |
+|---|---|---|---|---|
+| `idle` (what this plugin uses, and vlc) | blocked | blocked | works | **suspends** |
+| `sleep:idle` | blocked | blocked | refused | does nothing |
+
+`--what=sleep --mode=block` tells logind to refuse suspend outright, which takes away the power
+menu and the lid, so a laptop would sit in a bag running hot. Plasma's battery applet names the
+two cases in as many words: an `idle` inhibition reads *"is blocking screen locking"*, a
+`sleep:idle` one reads *"is blocking sleep and screen locking"*. This plugin is always the
+first kind.
+
+`keep_display_on` is not a separate lever on Linux: an idle inhibition already suppresses
+display-off, and on Plasma it also suppresses the screen lock. The option still tags the reason
+string, so `systemd-inhibit --list` shows what the session asked for.
+
 ### Robustness
 
 - **Idempotent:** re-prompting in a session that already has a live holder just refreshes the
   lock; it never stacks duplicate holders.
 - **Stale-lock reaping:** each `block` sweeps lock files whose recorded process is gone.
-- **PID-reuse-safe release:** the holder's start time is captured at launch and `unblock` only
-  terminates the PID if its live start time still matches — so a recycled PID belonging to an
-  unrelated process is never signalled.
+- **PID-reuse-safe release:** the holder's start time is captured at launch (`StartTime.Ticks`
+  on Windows, field 22 of `/proc/<pid>/stat` on Linux) and `unblock` only terminates the PID if
+  its live start time still matches — so a recycled PID belonging to an unrelated process is
+  never signalled. On Linux the signal goes to the whole process *group*, because
+  `systemd-inhibit` runs the backstop as a child that would otherwise be stranded.
 - **Max-lifetime backstop:** if a session crashes without firing `Stop`/`SessionEnd`, its
   holder self-releases after a hard ceiling (default 8 hours) instead of surviving until reboot.
 - **Hooks never block Claude:** the dispatcher wraps everything and always exits 0; a missing
@@ -112,14 +140,18 @@ when you enable the plugin and stores them in your `settings.json` under `plugin
 
 | Option | Default | What it does |
 |--------|---------|--------------|
-| **Keep the display on too** (`keep_display_on`) | off | Also keeps the monitor lit while Claude works, not just the system awake. **Does not prevent the lock screen** (see below). |
+| **Keep the display on too** (`keep_display_on`) | off | Also keeps the monitor lit while Claude works, not just the system awake. **Does not prevent the lock screen** on Windows (see below). No effect on Linux, where the idle inhibition already covers the display. |
 | **Max keep-awake hours** (`max_lifetime_hours`) | `8` | Safety backstop: a holder self-releases after this many hours (range 1–24) if a session ever crashes without cleaning up. No normal turn comes close. |
 
-> **`keep_display_on` keeps the screen powered, not unlocked.** It prevents the monitor from
-> dimming/turning off on the power-idle timer, but it does **not** stop your screensaver or
-> your organization's inactivity policy from locking the machine — those run off the
-> *input*-idle timer, which power requests don't touch. So expect: system never sleeps,
+> **On Windows, `keep_display_on` keeps the screen powered, not unlocked.** It prevents the
+> monitor from dimming/turning off on the power-idle timer, but it does **not** stop your
+> screensaver or your organization's inactivity policy from locking the machine — those run off
+> the *input*-idle timer, which power requests don't touch. So expect: system never sleeps,
 > screen stays on, but the machine can still lock.
+>
+> **On Linux the split doesn't exist.** There is one idle notion, so the inhibition that keeps
+> the system awake also keeps the display on, and on Plasma it suppresses the screen lock too.
+> That happens with or without `keep_display_on`, which is why the option changes nothing here.
 
 **Changing options later:** Claude Code captures these at *enable* time and doesn't yet
 offer an in-place editor. To change them, either re-enable the plugin via `/plugin`, or edit
@@ -141,20 +173,24 @@ node "<plugin-root>/scripts/dispatch.mjs" status
 ```
 
 It reports the detected environment, a `System sleep blocked : True/False` verdict (the
-Windows **host** state on WSL2), whether the display is being kept on, and any active holders
-with their session id, platform, PID, and liveness. The decisive test is differential — submit
-a prompt and you should see `True` while Claude works, returning to `False` after the turn ends.
+Windows **host** state on WSL2, the live `--list` verdict on Linux), whether the display is
+being kept on, and any active holders with their session id, platform, PID, and liveness. On
+Linux it also names the resolved backend. The decisive test is differential —
+submit a prompt and you should see `True` while Claude works, returning to `False` after the
+turn ends.
 
 ## Limitations
 
-- macOS and bare-metal Linux are not implemented yet (clean no-op there) — contributions
-  welcome.
+- macOS is not implemented yet (clean no-op there) — contributions welcome.
 - A holder orphaned by a hard crash persists until the max-lifetime backstop fires (default
   8 hours, configurable; the next prompt in any session also reaps it once its process is gone).
-- Never prevents the **lock screen** — only system sleep and (optionally) display-off. See
-  [Configuration](#configuration).
-- By default blocks *system* sleep only and lets the display turn off; set `keep_display_on`
-  to keep the monitor lit as well.
+- On Windows, never prevents the **lock screen** — only system sleep and (optionally)
+  display-off. On Linux the idle inhibition does suppress the Plasma lock screen as a
+  side-effect. See [Configuration](#configuration).
+- On Windows, by default blocks *system* sleep only and lets the display turn off; set
+  `keep_display_on` to keep the monitor lit as well. On Linux the display is always covered.
+- On Linux, never blocks a *deliberate* suspend. Closing the lid or picking Sleep from the
+  power menu still suspends the machine, mid-turn, exactly as it does while a video is playing.
 - Requires Node.js on `PATH` (see [Requirements](#requirements)).
 
 ## Architecture & contributing
@@ -174,20 +210,20 @@ tests/node/             node --test unit suite for the dispatcher
 tests/windows/          PSScriptAnalyzer settings for the remaining PowerShell
 ```
 
-**Adding macOS or Linux** is a focused change: teach `planHolder()` in
+**Adding macOS** is a focused change: teach `planHolder()` in
 `scripts/lib/dispatch-core.mjs` to return a holder for that environment instead of `null`, and
-have `dispatch.mjs` launch/terminate it. The two `userConfig` options map cleanly:
+have `dispatch.mjs` launch/terminate it (the Linux backend is the worked example). The two
+`userConfig` options map like this:
 
-| Concept | Windows / WSL2 | macOS | Linux |
+| Concept | Windows / WSL2 | Linux | macOS |
 |---------|----------------|-------|-------|
-| Block system sleep (always) | `PowerRequestSystemRequired` | `caffeinate -i` | `systemd-inhibit --what=sleep` |
-| `keep_display_on` | `PowerRequestDisplayRequired` | `caffeinate -d` | `systemd-inhibit --what=idle` (best-effort) |
-| `max_lifetime_hours` backstop | holder self-exit timer | `caffeinate -t` | holder `sleep` duration |
+| Block system sleep (always) | `PowerRequestSystemRequired` | `systemd-inhibit --what=idle --mode=block` | `caffeinate -i` |
+| `keep_display_on` | `PowerRequestDisplayRequired` | covered by the idle inhibition (no separate flag) | `caffeinate -d` |
+| `max_lifetime_hours` backstop | holder self-exit timer | duration of the wrapped `sleep` | `caffeinate -t` |
 
-Notes for those backends: `systemd-inhibit` has **no** timeout flag, so a backstop duration is
-required for `max_lifetime_hours` parity; the Linux `idle` inhibitor is honored only by desktop
-environments that respect `logind` (GNOME/KDE), so `keep_display_on` there is best-effort. None
-of these tools prevent the lock screen on any platform.
+Notes: neither `systemd-inhibit` nor `caffeinate` has a way to hold an inhibition without
+wrapping a command, so the backstop is the wrapped command's duration. `caffeinate -t` gives
+macOS the same ceiling for free.
 
 ## Development
 
@@ -204,6 +240,12 @@ CI runs on every push and pull request ([`.github/workflows/ci.yml`](.github/wor
 - **Node dispatcher tests**: `node --test` on Ubuntu and Windows.
 - **Windows PowerShell lint**:
   [PSScriptAnalyzer](https://github.com/PowerShell/PSScriptAnalyzer) over `scripts/`.
+
+The Linux suite (`tests/node/linux.test.mjs`) asserts the exact argv for every backend and
+option permutation on any OS, and adds one integration test that launches a real inhibitor,
+finds it in `--list`, and checks the group kill releases it. That test skips itself unless
+`systemd-inhibit`/`elogind-inhibit` is actually present, so it runs on the Ubuntu CI lane and
+is skipped on Windows.
 
 The detached-holder *survival* across the hook process exiting is the one behavior that can
 only be confirmed by a real plugin run (test harnesses reap background processes); the rest of

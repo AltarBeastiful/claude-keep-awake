@@ -7,6 +7,9 @@ import {
   buildReason,
   buildHolderPrelude,
   buildPowerShellHolderInvocation,
+  resolveLinuxInhibitor,
+  buildLinuxHolderInvocation,
+  buildLinuxReason,
 } from './core.mjs';
 
 // Decide how to hold the machine awake for a given environment, or return null when the
@@ -15,8 +18,20 @@ import {
 //   win32          -> powershell.exe -EncodedCommand holding PowerSetRequest
 //   wsl + interop  -> same, launched over WSL interop (holds the request on the HOST)
 //   wsl, no interop-> null  (a keep-awake inside the WSL2 VM cannot hold the host awake)
-//   darwin, linux  -> null  (native backends not implemented yet; detected but no-op)
-export function planHolder({ env, sessionId, keepDisplay, maxHours, holderBody, interopAvailable }) {
+//   linux          -> systemd-inhibit / elogind-inhibit / gnome-session-inhibit holding an
+//                     idle inhibition, or null when none of them is installed
+//   darwin         -> null  (native backend not implemented yet; detected but no-op)
+export function planHolder({ env, sessionId, keepDisplay, maxHours, holderBody, interopAvailable, resolveBin }) {
+  if (env === 'linux') {
+    const inhibitor = resolveLinuxInhibitor({ resolveBin });
+    if (!inhibitor) return null;
+    return buildLinuxHolderInvocation({
+      inhibitor,
+      reason: buildLinuxReason({ sessionId, keepDisplay }),
+      maxHours,
+    });
+  }
+
   if (env === 'wsl' && !interopAvailable) return null;
   if (env !== 'win32' && env !== 'wsl') return null;
 
@@ -37,6 +52,7 @@ export function planHolder({ env, sessionId, keepDisplay, maxHours, holderBody, 
 //   log(msg) -> void,
 //   holderBody: string,                      // contents of holder.ps1
 //   interopAvailable?: bool,                 // wsl only
+//   resolveBin?: (name) => path | null,      // linux only: PATH lookup for the inhibit binary
 // }
 export function runDispatch({ action, env, sessionId, options, deps }) {
   if (action === 'unblock') return unblock({ sessionId, deps });
@@ -67,6 +83,7 @@ function block({ env, sessionId, options, deps }) {
     maxHours: options.maxHours,
     holderBody: deps.holderBody,
     interopAvailable: deps.interopAvailable,
+    resolveBin: deps.resolveBin,
   });
   if (!invocation) {
     deps.log(`keep-awake: no backend for environment '${env}' -- not blocking sleep (no-op).`);

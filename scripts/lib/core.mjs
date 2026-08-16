@@ -82,18 +82,26 @@ export function parseProbeOutput(stdout) {
 
 // Build the human-readable status report. Pure: callers supply the detected env, the probed
 // power state, and the lock list (each annotated with liveness).
+//
+// state fields beyond `supported` are all optional, so each backend reports only what it can
+// actually observe: Windows/WSL2 have a display verdict, Linux has a backend name.
 export function formatStatusReport({ env, state, locks, now }) {
   const lines = [];
   lines.push(`Environment          : ${env}`);
 
   if (state && state.supported) {
+    if (state.backend) lines.push(`Backend              : ${state.backend}`);
     lines.push(`System sleep blocked : ${state.systemBlocked === null ? 'unknown' : state.systemBlocked ? 'True' : 'False'}`);
-    lines.push(`Display kept on      : ${state.displayOn === null ? 'unknown' : state.displayOn ? 'True' : 'False'}`);
+    if (state.displayOn !== undefined) {
+      lines.push(`Display kept on      : ${state.displayOn === null ? 'unknown' : state.displayOn ? 'True' : 'False'}`);
+    }
     if (env === 'wsl') {
       lines.push('(WSL2: the Windows HOST is kept awake via interop, not the Linux VM.)');
     }
+    for (const note of state.notes || []) lines.push(note);
   } else {
-    lines.push(`Platform '${env}' backend: not implemented in v1.2.0 -- keep-awake is a no-op here.`);
+    lines.push(`Platform '${env}' backend: not implemented -- keep-awake is a no-op here.`);
+    for (const note of (state && state.notes) || []) lines.push(note);
   }
 
   lines.push('Active keep-awake workers:');
@@ -260,6 +268,132 @@ export function buildVerifyAndKillCommand(pid, procStart) {
     `  if ($ticks -eq ${procStart}) { Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue }`,
     '}',
   ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Linux inhibitor construction (bare-metal Linux; NOT WSL2, which delegates to the host)
+// ---------------------------------------------------------------------------
+
+// The WHO field every Claude holder registers under. Constant (no session id) so `status` can
+// pick our rows out of `--list` by exact match; the session id travels in WHY instead.
+export const LINUX_INHIBIT_WHO = 'Claude Code';
+
+// The WHY field. Desktop UIs render an inhibition as "<WHO> is blocking screen locking.
+// (<WHY>)" -- Plasma's battery applet does exactly this -- so WHY reads as a continuation of
+// WHO rather than repeating it, the way vlc reports "Playing some media.".
+export function buildLinuxReason({ sessionId, keepDisplay }) {
+  return `Working on session ${sessionId}${keepDisplay ? ' [display]' : ''}`;
+}
+
+// Inhibit backends in preference order. All three take "hold this inhibition for as long as
+// COMMAND runs", so the holder is `<backend> <flags> <backstop-command>` and releasing is just
+// terminating it.
+//
+//   systemd-inhibit        systemd (the overwhelming majority of desktop Linux)
+//   elogind-inhibit        elogind: Void, Artix, Gentoo OpenRC, Devuan, Alpine -- same CLI
+//   gnome-session-inhibit  GNOME's own session API, for GNOME setups that drive their idle
+//                          timer from gnome-session rather than from logind
+//
+// Every backend inhibits *idle* only -- never `sleep`. See buildLinuxHolderInvocation.
+export const LINUX_INHIBIT_BACKENDS = ['systemd-inhibit', 'elogind-inhibit', 'gnome-session-inhibit'];
+
+// Pick the first available backend. `resolveBin(name)` is injected (a PATH lookup in
+// dispatch.mjs) so this stays pure and testable off-Linux. Returns null when none is present,
+// which the caller turns into the existing benign no-op.
+export function resolveLinuxInhibitor({ resolveBin }) {
+  if (typeof resolveBin !== 'function') return null;
+  for (const name of LINUX_INHIBIT_BACKENDS) {
+    const path = resolveBin(name);
+    if (path) return { name, path };
+  }
+  return null;
+}
+
+// None of these tools can hold an inhibition without wrapping a command, so the command IS the
+// max-lifetime backstop: the inhibition lives exactly as long as this `sleep` does. That is
+// also how `max_lifetime_hours` parity is reached, since systemd-inhibit has no timeout flag.
+export function buildBackstopCommand({ maxHours }) {
+  const hours = Number(maxHours);
+  if (!Number.isFinite(hours)) throw new TypeError(`maxHours must be finite, got ${maxHours}`);
+  return ['sleep', String(Math.max(1, Math.round(hours * 3600)))];
+}
+
+// Build the detached holder invocation for bare-metal Linux.
+//
+// `--what=idle`, deliberately, for every configuration. This is the same inhibition a media
+// player holds while playing, and the difference from `sleep` is not cosmetic:
+//
+//   * `idle` says the true thing -- this session is not inactive -- and it is what every
+//     desktop idle timer (logind's IdleAction, KDE PowerDevil, GNOME) consults. It stops the
+//     machine idling into suspend, and leaves every *deliberate* suspend path working:
+//     `systemctl suspend`, the power menu, and closing the lid all still suspend.
+//   * `sleep` would take those away. `--what=sleep --mode=block` tells logind to refuse
+//     suspend outright, so closing the lid would silently do nothing and a laptop would cook
+//     in a bag. Plasma's battery applet spells the difference out: an `idle` inhibition reads
+//     "blocking screen locking", a `sleep:idle` one reads "blocking sleep and screen locking".
+//   * `keep_display_on` is not a separate lever here: an idle inhibition already suppresses
+//     display-off (and, on Plasma, screen locking) on the desktops that honor it. The option
+//     still tags the reason string so `--list` shows what the session asked for.
+export function buildLinuxHolderInvocation({ inhibitor, reason, maxHours }) {
+  const backstop = buildBackstopCommand({ maxHours });
+
+  if (inhibitor.name === 'gnome-session-inhibit') {
+    return {
+      command: inhibitor.path,
+      args: ['--app-id', LINUX_INHIBIT_WHO, '--reason', reason, '--inhibit', 'idle', ...backstop],
+    };
+  }
+
+  // systemd-inhibit / elogind-inhibit share this CLI surface exactly.
+  return {
+    command: inhibitor.path,
+    args: ['--what=idle', `--who=${LINUX_INHIBIT_WHO}`, `--why=${reason}`, '--mode=block', ...backstop],
+  };
+}
+
+// Parse `systemd-inhibit --list` / `elogind-inhibit --list` into rows. The columns are
+// whitespace-separated but WHO and WHY may themselves contain spaces, so anchor on the
+// unambiguous middle (UID, USER, PID -- digits, word, digits) and on the MODE terminator.
+// Header and the "N inhibitors listed." footer simply don't match and are dropped.
+export function parseInhibitList(stdout) {
+  const rows = [];
+  for (const line of String(stdout || '').split('\n')) {
+    const m = line.match(/^(.*?)\s+(\d+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*?)\s+(block|delay)\s*$/);
+    if (!m) continue;
+    rows.push({
+      who: m[1].trim(),
+      uid: Number.parseInt(m[2], 10),
+      user: m[3],
+      pid: Number.parseInt(m[4], 10),
+      comm: m[5],
+      what: m[6],
+      why: m[7].trim(),
+      mode: m[8],
+    });
+  }
+  return rows;
+}
+
+// True if any listed inhibitor actually blocks idle right now -- the Linux analogue of the
+// Windows SYSTEM_REQUIRED probe. `what` is a colon-joined set ("sleep:idle"), so match a whole
+// element, not a substring.
+export function isIdleBlocked(rows) {
+  return (rows || []).some((r) => r.mode === 'block' && String(r.what).split(':').includes('idle'));
+}
+
+// Read a process's start time (field 22 of /proc/<pid>/stat) as the PID-reuse-safe identity,
+// mirroring what StartTime.Ticks does on Windows. Field 2 is the comm, which is parenthesized
+// and may itself contain spaces and parens -- so split only AFTER the last ')'. Returned as a
+// STRING so the identity check is exact string equality, as on Windows.
+export function parseProcStartTime(statText) {
+  if (!statText) return null;
+  const text = String(statText);
+  const close = text.lastIndexOf(')');
+  if (close < 0) return null;
+  const fields = text.slice(close + 1).trim().split(/\s+/);
+  // fields[0] is stat field 3 (state), so stat field 22 is fields[19].
+  const starttime = fields[19];
+  return /^\d+$/.test(starttime || '') ? starttime : null;
 }
 
 // Whether Windows interop is actually usable from this WSL distro. WSL registers a binfmt_misc
