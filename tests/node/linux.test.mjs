@@ -10,10 +10,10 @@ import {
   resolveLinuxInhibitor,
   buildBackstopCommand,
   buildLinuxHolderInvocation,
+  buildLinuxReason,
   parseInhibitList,
   isIdleBlocked,
   parseProcStartTime,
-  parseLidState,
 } from '../../scripts/lib/core.mjs';
 
 // The Linux backend is built out of pure functions taking an injected `resolveBin`, so the full
@@ -49,47 +49,37 @@ test('LINUX_INHIBIT_BACKENDS: the documented preference order', () => {
 
 // --- backstop command (max_lifetime_hours parity: systemd-inhibit has no timeout flag) ---
 
-test('buildBackstopCommand: no lid -> plain sleep of maxHours in seconds', () => {
-  assert.deepEqual(buildBackstopCommand({ maxHours: 8, lidPath: null }), ['sleep', '28800']);
-  assert.deepEqual(buildBackstopCommand({ maxHours: 1, lidPath: null }), ['sleep', '3600']);
+test('buildBackstopCommand: a sleep of maxHours in seconds', () => {
+  assert.deepEqual(buildBackstopCommand({ maxHours: 8 }), ['sleep', '28800']);
+  assert.deepEqual(buildBackstopCommand({ maxHours: 1 }), ['sleep', '3600']);
 });
 
 test('buildBackstopCommand: fractional hours round to whole seconds', () => {
-  assert.deepEqual(buildBackstopCommand({ maxHours: 1.5, lidPath: null }), ['sleep', '5400']);
+  assert.deepEqual(buildBackstopCommand({ maxHours: 1.5 }), ['sleep', '5400']);
 });
 
 test('buildBackstopCommand: a non-finite maxHours throws rather than emitting garbage', () => {
-  assert.throws(() => buildBackstopCommand({ maxHours: NaN, lidPath: null }), TypeError);
+  assert.throws(() => buildBackstopCommand({ maxHours: NaN }), TypeError);
 });
 
-test('buildBackstopCommand: with a lid -> an sh watchdog carrying the deadline and lid path', () => {
-  const cmd = buildBackstopCommand({ maxHours: 8, lidPath: '/proc/acpi/button/lid/LID/state' });
-  assert.equal(cmd[0], 'sh');
-  assert.equal(cmd[1], '-c');
-  assert.match(cmd[2], /\+28800/, 'the backstop deadline still applies');
-  assert.match(cmd[2], /'\/proc\/acpi\/button\/lid\/LID\/state'/);
+// --- reason string (what desktop UIs render) ---
+
+test('buildLinuxReason: reads as a continuation of WHO, not a repeat of it', () => {
+  // Plasma's battery applet renders "<WHO> is blocking screen locking. (<WHY>)".
+  assert.equal(buildLinuxReason({ sessionId: 'abc', keepDisplay: false }), 'Working on session abc');
 });
 
-test('buildBackstopCommand: the watchdog exits once the lid reads closed', () => {
-  const script = buildBackstopCommand({ maxHours: 8, lidPath: '/proc/acpi/button/lid/LID/state' })[2];
-  assert.match(script, /\*closed\*\)\s*exit 0/);
-  // The lid is read BEFORE the first sleep, so blocking with an already-closed lid releases
-  // immediately instead of holding for a whole poll interval.
-  assert.ok(script.indexOf('closed') < script.indexOf('sleep '), 'lid check precedes the sleep');
-});
-
-test('buildBackstopCommand: a quote in the lid path cannot break out of the sh literal', () => {
-  const script = buildBackstopCommand({ maxHours: 1, lidPath: "/tmp/it's/state" })[2];
-  assert.match(script, /'\/tmp\/it'\\''s\/state'/);
+test('buildLinuxReason: keep_display_on tags the reason so --list shows what was asked', () => {
+  assert.equal(buildLinuxReason({ sessionId: 'abc', keepDisplay: true }), 'Working on session abc [display]');
 });
 
 // --- holder invocation per backend ---
 
 const INHIBITOR = { name: 'systemd-inhibit', path: '/usr/bin/systemd-inhibit' };
-const REASON = 'Claude Code keep-awake (session AAA)';
+const REASON = 'Working on session AAA';
 
 test('buildLinuxHolderInvocation: systemd-inhibit argv (idle, block, who/why, backstop)', () => {
-  const inv = buildLinuxHolderInvocation({ inhibitor: INHIBITOR, reason: REASON, maxHours: 8, lidPath: null });
+  const inv = buildLinuxHolderInvocation({ inhibitor: INHIBITOR, reason: REASON, maxHours: 8 });
   assert.equal(inv.command, '/usr/bin/systemd-inhibit');
   assert.deepEqual(inv.args, [
     '--what=idle',
@@ -101,18 +91,28 @@ test('buildLinuxHolderInvocation: systemd-inhibit argv (idle, block, who/why, ba
   ]);
 });
 
-test('buildLinuxHolderInvocation: NEVER inhibits sleep -- deliberate suspend and lid-close must work', () => {
-  const inv = buildLinuxHolderInvocation({ inhibitor: INHIBITOR, reason: REASON, maxHours: 8, lidPath: null });
-  const what = inv.args.find((a) => a.startsWith('--what='));
-  assert.equal(what, '--what=idle');
-  assert.ok(!what.includes('sleep'), '--what=sleep with --mode=block would block `systemctl suspend` too');
+// This is the load-bearing assertion of the whole backend. `--what=sleep --mode=block` tells
+// logind to refuse suspend outright, which takes away `systemctl suspend`, the power menu, and
+// lid close. `idle` is the inhibition a media player holds: it stops the machine idling into
+// suspend and leaves every deliberate suspend path working.
+test('buildLinuxHolderInvocation: inhibits idle ONLY, never sleep', () => {
+  for (const keepDisplay of [false, true]) {
+    const inv = buildLinuxHolderInvocation({
+      inhibitor: INHIBITOR,
+      reason: buildLinuxReason({ sessionId: 'AAA', keepDisplay }),
+      maxHours: 8,
+    });
+    const what = inv.args.find((a) => a.startsWith('--what='));
+    assert.equal(what, '--what=idle');
+    assert.ok(!what.includes('sleep'), 'a sleep inhibition would break lid close and `systemctl suspend`');
+  }
 });
 
 test('buildLinuxHolderInvocation: keep_display_on does not change --what (documented side-effect)', () => {
   // On Linux an idle inhibition already suppresses display-off; the option only tags the reason
   // string, which is what shows up in `systemd-inhibit --list`.
-  const off = buildLinuxHolderInvocation({ inhibitor: INHIBITOR, reason: 'r', maxHours: 8, lidPath: null });
-  const on = buildLinuxHolderInvocation({ inhibitor: INHIBITOR, reason: 'r [display]', maxHours: 8, lidPath: null });
+  const off = buildLinuxHolderInvocation({ inhibitor: INHIBITOR, reason: 'r', maxHours: 8 });
+  const on = buildLinuxHolderInvocation({ inhibitor: INHIBITOR, reason: 'r [display]', maxHours: 8 });
   assert.deepEqual(
     off.args.filter((a) => a.startsWith('--what=')),
     on.args.filter((a) => a.startsWith('--what=')),
@@ -125,7 +125,6 @@ test('buildLinuxHolderInvocation: elogind-inhibit shares the systemd CLI surface
     inhibitor: { name: 'elogind-inhibit', path: '/usr/bin/elogind-inhibit' },
     reason: REASON,
     maxHours: 2,
-    lidPath: null,
   });
   assert.equal(inv.command, '/usr/bin/elogind-inhibit');
   assert.ok(inv.args.includes('--what=idle'));
@@ -138,7 +137,6 @@ test('buildLinuxHolderInvocation: gnome-session-inhibit uses its own flag spelli
     inhibitor: { name: 'gnome-session-inhibit', path: '/usr/bin/gnome-session-inhibit' },
     reason: REASON,
     maxHours: 8,
-    lidPath: null,
   });
   assert.deepEqual(inv.args, [
     '--app-id',
@@ -154,23 +152,11 @@ test('buildLinuxHolderInvocation: gnome-session-inhibit uses its own flag spelli
   assert.ok(!inv.args.includes('suspend'));
 });
 
-test('buildLinuxHolderInvocation: the lid watchdog is the wrapped command on laptops', () => {
-  const inv = buildLinuxHolderInvocation({
-    inhibitor: INHIBITOR,
-    reason: REASON,
-    maxHours: 8,
-    lidPath: '/proc/acpi/button/lid/LID0/state',
-  });
-  assert.equal(inv.args[inv.args.length - 3], 'sh');
-  assert.equal(inv.args[inv.args.length - 2], '-c');
-  assert.match(inv.args[inv.args.length - 1], /LID0/);
-});
-
 // --- `systemd-inhibit --list` parsing (the status differential) ---
 
 const LIST = `WHO                          UID  USER PID  COMM            WHAT                          WHY                                     MODE
 NetworkManager               0    root 1645 NetworkManager  sleep                         NetworkManager needs to turn off nets   delay
-Claude Code                  1000 remi 4114007 systemd-inhibit idle                       Claude Code keep-awake (session AAA)    block
+Claude Code                  1000 remi 4114007 systemd-inhibit idle                       Working on session AAA                  block
 PowerDevil                   1000 remi 2930 org_kde_powerde handle-power-key:handle-lid-switch KDE handles power events           block
 
 4 inhibitors listed.`;
@@ -187,7 +173,7 @@ test('parseInhibitList: keeps multi-word WHO and WHY intact', () => {
   assert.equal(ours.comm, 'systemd-inhibit');
   assert.equal(ours.what, 'idle');
   assert.equal(ours.mode, 'block');
-  assert.equal(ours.why, 'Claude Code keep-awake (session AAA)');
+  assert.equal(ours.why, 'Working on session AAA');
 });
 
 test('parseInhibitList: garbage in -> empty list, not a throw', () => {
@@ -231,19 +217,6 @@ test('parseProcStartTime: missing/garbled input -> null (never a wrong identity)
   assert.equal(parseProcStartTime(''), null);
   assert.equal(parseProcStartTime('no parens here'), null);
   assert.equal(parseProcStartTime('1 (short) S 1 1'), null);
-});
-
-// --- lid state ---
-
-test('parseLidState: reads the ACPI button file', () => {
-  assert.equal(parseLidState('state:      open\n'), 'open');
-  assert.equal(parseLidState('state:      closed\n'), 'closed');
-});
-
-test('parseLidState: absent or unrecognized -> null (treated as "no lid")', () => {
-  assert.equal(parseLidState(null), null);
-  assert.equal(parseLidState(''), null);
-  assert.equal(parseLidState('state:      unknown'), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -291,8 +264,8 @@ function childrenOf(ppid) {
 const settle = () => new Promise((r) => setTimeout(r, 500));
 
 test('integration: a launched holder registers an idle inhibitor and releases on group kill', { skip: !canIntegrate }, async () => {
-  const reason = `Claude Code keep-awake (session test-${process.pid})`;
-  const inv = buildLinuxHolderInvocation({ inhibitor: realBin, reason, maxHours: 0.05, lidPath: null });
+  const reason = buildLinuxReason({ sessionId: `test-${process.pid}`, keepDisplay: false });
+  const inv = buildLinuxHolderInvocation({ inhibitor: realBin, reason, maxHours: 0.05 });
 
   const child = spawn(inv.command, inv.args, { detached: true, stdio: 'ignore' });
   child.on('error', () => {});
@@ -305,6 +278,7 @@ test('integration: a launched holder registers an idle inhibitor and releases on
   const rows = parseInhibitList(list());
   const ours = rows.find((r) => r.pid === child.pid);
   assert.ok(ours, 'our holder should appear in --list');
+  // Exactly `idle`, not `sleep:idle`: the machine must still suspend on a lid close.
   assert.equal(ours.what, 'idle');
   assert.equal(ours.mode, 'block');
   assert.equal(ours.why, reason);

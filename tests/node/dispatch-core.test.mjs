@@ -43,17 +43,16 @@ test('planHolder: linux -> the resolved inhibitor holding an idle inhibition', (
     maxHours: 8,
     holderBody: HOLDER_BODY,
     resolveBin: (n) => (n === 'systemd-inhibit' ? '/usr/bin/systemd-inhibit' : null),
-    lidPath: null,
   });
   assert.equal(inv.command, '/usr/bin/systemd-inhibit');
-  assert.ok(inv.args.includes('--what=idle'));
-  assert.ok(inv.args.includes('--why=Claude Code keep-awake (session AAA)'));
+  assert.ok(inv.args.includes('--what=idle'), 'idle only: lid close must still suspend');
+  assert.ok(inv.args.includes('--why=Working on session AAA'));
   assert.deepEqual(inv.args.slice(-2), ['sleep', '28800']);
 });
 
 test('planHolder: linux with no inhibit backend installed -> null (benign no-op)', () => {
   assert.equal(
-    planHolder({ env: 'linux', sessionId: 'AAA', keepDisplay: false, maxHours: 8, holderBody: HOLDER_BODY, resolveBin: () => null, lidPath: null }),
+    planHolder({ env: 'linux', sessionId: 'AAA', keepDisplay: false, maxHours: 8, holderBody: HOLDER_BODY, resolveBin: () => null }),
     null,
   );
 });
@@ -190,7 +189,7 @@ test('block on linux with no inhibit backend is a no-op', () => {
 
 test('block on linux with systemd-inhibit spawns the holder and records the platform', () => {
   const h = harness();
-  const deps = { ...h.deps, resolveBin: (n) => (n === 'systemd-inhibit' ? '/usr/bin/systemd-inhibit' : null), lidPath: null };
+  const deps = { ...h.deps, resolveBin: (n) => (n === 'systemd-inhibit' ? '/usr/bin/systemd-inhibit' : null) };
   const r = runDispatch({ action: 'block', env: 'linux', sessionId: 'AAA', options: baseOpts, deps });
   assert.equal(r.result, 'started');
   assert.equal(h.spawns.length, 1);

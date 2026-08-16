@@ -69,17 +69,20 @@ own `IdleAction`, KDE PowerDevil, GNOME). If `systemd-inhibit` is absent the dis
 back to `elogind-inhibit` (Void, Artix, Gentoo OpenRC, Devuan, Alpine; same CLI) and then to
 `gnome-session-inhibit`; with none of them installed it is a benign no-op.
 
-Two Linux-specific design choices are worth knowing about:
+**It inhibits `idle`, never `sleep`**, and on Linux that distinction is the whole design. It is
+the same inhibition a media player holds while playing, so the behaviour is the one you already
+know from watching a video:
 
-- **It inhibits `idle`, never `sleep`.** `--what=sleep --mode=block` would also block
-  *deliberate* suspend, so `systemctl suspend` and closing the lid would silently do nothing.
-  Inhibiting `idle` states the thing that is actually true (this session is not inactive) and
-  leaves explicit suspend working.
-- **Closing the lid releases the inhibition.** KDE and GNOME suppress the lid-close suspend
-  action while an idle inhibition is held, which would leave a laptop running hot in a bag. So
-  the wrapped backstop is a small watchdog that polls the ACPI lid state (every 5s) and exits
-  as soon as the lid reads `closed`, dropping the inhibition and letting the machine suspend
-  normally. On desktops (no lid) the backstop is a plain `sleep`.
+| `--what=` | Idle sleep | Screen lock / blank | `systemctl suspend` | Closing the lid |
+|---|---|---|---|---|
+| `idle` (what this plugin uses, and vlc) | blocked | blocked | works | **suspends** |
+| `sleep:idle` | blocked | blocked | refused | does nothing |
+
+`--what=sleep --mode=block` tells logind to refuse suspend outright, which takes away the power
+menu and the lid, so a laptop would sit in a bag running hot. Plasma's battery applet names the
+two cases in as many words: an `idle` inhibition reads *"is blocking screen locking"*, a
+`sleep:idle` one reads *"is blocking sleep and screen locking"*. This plugin is always the
+first kind.
 
 `keep_display_on` is not a separate lever on Linux: an idle inhibition already suppresses
 display-off, and on Plasma it also suppresses the screen lock. The option still tags the reason
@@ -172,7 +175,7 @@ node "<plugin-root>/scripts/dispatch.mjs" status
 It reports the detected environment, a `System sleep blocked : True/False` verdict (the
 Windows **host** state on WSL2, the live `--list` verdict on Linux), whether the display is
 being kept on, and any active holders with their session id, platform, PID, and liveness. On
-Linux it also names the resolved backend and the lid state. The decisive test is differential —
+Linux it also names the resolved backend. The decisive test is differential —
 submit a prompt and you should see `True` while Claude works, returning to `False` after the
 turn ends.
 
@@ -186,8 +189,8 @@ turn ends.
   side-effect. See [Configuration](#configuration).
 - On Windows, by default blocks *system* sleep only and lets the display turn off; set
   `keep_display_on` to keep the monitor lit as well. On Linux the display is always covered.
-- On Linux, closing the laptop lid releases the inhibition within ~5s, on purpose. The machine
-  then suspends on its normal idle timer rather than staying awake in a bag.
+- On Linux, never blocks a *deliberate* suspend. Closing the lid or picking Sleep from the
+  power menu still suspends the machine, mid-turn, exactly as it does while a video is playing.
 - Requires Node.js on `PATH` (see [Requirements](#requirements)).
 
 ## Architecture & contributing

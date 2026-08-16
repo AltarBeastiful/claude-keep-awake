@@ -62,23 +62,21 @@ test('formatStatusReport: unsupported env (darwin) says no-op, no power lines', 
   assert.doesNotMatch(report, /System sleep blocked/);
 });
 
-test('formatStatusReport: linux reports the backend, the idle verdict, and the lid', () => {
+test('formatStatusReport: linux reports the backend and the idle verdict', () => {
   const report = formatStatusReport({
     env: 'linux',
     state: {
       supported: true,
       backend: 'systemd-inhibit (/usr/bin/systemd-inhibit)',
       systemBlocked: true,
-      lid: 'open',
-      notes: ['Idle inhibitors held by Claude: 1'],
+      notes: ['Idle inhibitors held by this plugin: 1'],
     },
     locks: [{ sessionId: 'AAA', record: { pid: 100, platform: 'linux', startedAt: '2026-06-14T05:00:00.000Z' }, alive: true }],
     now: NOW,
   });
   assert.match(report, /Backend\s*:\s*systemd-inhibit/);
   assert.match(report, /System sleep blocked\s*:\s*True/);
-  assert.match(report, /Laptop lid\s*:\s*open/);
-  assert.match(report, /Idle inhibitors held by Claude: 1/);
+  assert.match(report, /Idle inhibitors held by this plugin: 1/);
   // No display verdict on Linux: an idle inhibition covers display-off implicitly, so claiming
   // a separate True/False would be a lie. The README explains the side-effect instead.
   assert.doesNotMatch(report, /Display kept on/);
@@ -87,7 +85,7 @@ test('formatStatusReport: linux reports the backend, the idle verdict, and the l
 test('formatStatusReport: linux with no inhibit backend still surfaces its note', () => {
   const report = formatStatusReport({
     env: 'linux',
-    state: { supported: false, lid: 'open', notes: ['(No inhibit backend found: install systemd, elogind, or gnome-session-inhibit.)'] },
+    state: { supported: false, notes: ['(No inhibit backend found: install systemd, elogind, or gnome-session-inhibit.)'] },
     locks: [],
     now: NOW,
   });

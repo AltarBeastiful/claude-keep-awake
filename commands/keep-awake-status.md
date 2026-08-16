@@ -15,6 +15,5 @@ The output reports the detected environment (win32 / wsl / darwin / linux), whet
 sleep is currently blocked and whether the display is being kept on, and any active keep-awake
 worker locks with their session id, platform, PID, and liveness. On WSL2 the power state is the
 Windows **host** state (queried over interop). On Linux it also names the resolved inhibit
-backend and the laptop lid state, and the blocked verdict comes from `systemd-inhibit --list`.
-On macOS, and on Linux with no inhibit backend installed, the report says the backend is a
-no-op.
+backend, and the blocked verdict comes from `systemd-inhibit --list`. On macOS, and on Linux
+with no inhibit backend installed, the report says the backend is a no-op.

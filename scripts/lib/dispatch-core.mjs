@@ -9,6 +9,7 @@ import {
   buildPowerShellHolderInvocation,
   resolveLinuxInhibitor,
   buildLinuxHolderInvocation,
+  buildLinuxReason,
 } from './core.mjs';
 
 // Decide how to hold the machine awake for a given environment, or return null when the
@@ -20,15 +21,14 @@ import {
 //   linux          -> systemd-inhibit / elogind-inhibit / gnome-session-inhibit holding an
 //                     idle inhibition, or null when none of them is installed
 //   darwin         -> null  (native backend not implemented yet; detected but no-op)
-export function planHolder({ env, sessionId, keepDisplay, maxHours, holderBody, interopAvailable, resolveBin, lidPath }) {
+export function planHolder({ env, sessionId, keepDisplay, maxHours, holderBody, interopAvailable, resolveBin }) {
   if (env === 'linux') {
     const inhibitor = resolveLinuxInhibitor({ resolveBin });
     if (!inhibitor) return null;
     return buildLinuxHolderInvocation({
       inhibitor,
-      reason: buildReason({ sessionId, keepDisplay }),
+      reason: buildLinuxReason({ sessionId, keepDisplay }),
       maxHours,
-      lidPath,
     });
   }
 
@@ -53,7 +53,6 @@ export function planHolder({ env, sessionId, keepDisplay, maxHours, holderBody, 
 //   holderBody: string,                      // contents of holder.ps1
 //   interopAvailable?: bool,                 // wsl only
 //   resolveBin?: (name) => path | null,      // linux only: PATH lookup for the inhibit binary
-//   lidPath?: string | null,                 // linux only: ACPI lid state file, if any
 // }
 export function runDispatch({ action, env, sessionId, options, deps }) {
   if (action === 'unblock') return unblock({ sessionId, deps });
@@ -85,7 +84,6 @@ function block({ env, sessionId, options, deps }) {
     holderBody: deps.holderBody,
     interopAvailable: deps.interopAvailable,
     resolveBin: deps.resolveBin,
-    lidPath: deps.lidPath,
   });
   if (!invocation) {
     deps.log(`keep-awake: no backend for environment '${env}' -- not blocking sleep (no-op).`);

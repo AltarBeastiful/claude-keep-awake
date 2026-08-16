@@ -37,7 +37,6 @@ import {
   parseInhibitList,
   isIdleBlocked,
   parseProcStartTime,
-  parseLidState,
   LINUX_INHIBIT_WHO,
 } from './lib/core.mjs';
 import { runDispatch } from './lib/dispatch-core.mjs';
@@ -154,22 +153,6 @@ function resolveBin(name) {
   return null;
 }
 
-// The ACPI lid state file, if this machine has a lid. The directory name is firmware-defined
-// (LID, LID0, LID1...), so enumerate rather than guess. null on desktops and on kernels
-// without the ACPI button driver -- the holder then uses a plain backstop with no lid watch.
-function findLidPath() {
-  const base = '/proc/acpi/button/lid';
-  try {
-    for (const entry of readdirSync(base)) {
-      const path = join(base, entry, 'state');
-      if (readFileText(path) !== null) return path;
-    }
-  } catch {
-    /* no lid */
-  }
-  return null;
-}
-
 // Launch the detached inhibitor and return its identity { pid, procStart }.
 //
 // - `detached: true` puts the holder in its own process group (so pgid === pid) AND detaches it
@@ -257,18 +240,17 @@ function makeLifecycle(env) {
 // Windows SYSTEM_REQUIRED probe, so `/keep-awake-status` supports the same differential check
 // (True while a turn runs, False after it ends). gnome-session-inhibit's `--list` has a
 // different format we don't parse, so there the verdict is honestly reported as unknown.
-function probeLinuxState() {
+function probeLinuxState(lockPids) {
   const inhibitor = resolveLinuxInhibitor({ resolveBin });
-  const lid = parseLidState(readFileText(findLidPath() ?? ''));
   const notes = [];
 
   if (!inhibitor) {
     notes.push('(No inhibit backend found: install systemd, elogind, or gnome-session-inhibit.)');
-    return { supported: false, lid, notes };
+    return { supported: false, notes };
   }
 
   let systemBlocked = null;
-  let ours = 0;
+  let ours = null;
   if (inhibitor.name !== 'gnome-session-inhibit') {
     const res = spawnSync(inhibitor.path, ['--list'], {
       encoding: 'utf8',
@@ -277,15 +259,17 @@ function probeLinuxState() {
     if (!res.error && res.status === 0) {
       const rows = parseInhibitList(res.stdout);
       systemBlocked = isIdleBlocked(rows);
-      ours = rows.filter((r) => r.who === LINUX_INHIBIT_WHO).length;
+      // Match on the recorded holder PIDs, not on WHO: any other tool is free to register
+      // under the same name, and counting those would overstate what this plugin is holding.
+      ours = rows.filter((r) => lockPids.has(r.pid) && r.who === LINUX_INHIBIT_WHO).length;
     }
   }
 
-  notes.push(`Idle inhibitors held by Claude: ${ours}`);
-  notes.push('(An idle inhibition also suppresses display-off and, on Plasma, the screen lock.)');
-  if (lid) notes.push('(Closing the lid releases the inhibition, so the machine can suspend.)');
+  if (ours !== null) notes.push(`Idle inhibitors held by this plugin: ${ours}`);
+  notes.push('(Idle inhibition, the kind a media player holds: blocks idle sleep and the screen');
+  notes.push(' lock. Deliberate suspend still works, lid close included.)');
 
-  return { supported: true, backend: `${inhibitor.name} (${inhibitor.path})`, systemBlocked, lid, notes };
+  return { supported: true, backend: `${inhibitor.name} (${inhibitor.path})`, systemBlocked, notes };
 }
 
 // Read and print the cross-platform status report (the /keep-awake-status command). Writes to
@@ -304,7 +288,7 @@ function runStatus(env, lifecycle) {
     const parsed = parseProbeOutput(probe.stdout);
     state = { supported: true, ...parsed };
   } else if (env === 'linux') {
-    state = probeLinuxState();
+    state = probeLinuxState(new Set(locks.map((l) => l.record && l.record.pid).filter(Boolean)));
   } else {
     state = { supported: false };
   }
@@ -346,7 +330,6 @@ function main() {
     holderBody: readFileText(join(HERE, 'windows', 'holder.ps1')) ?? '',
     interopAvailable: env === 'wsl' ? isInteropAvailable({ readFileText }) : false,
     resolveBin,
-    lidPath: env === 'linux' ? findLidPath() : null,
   };
 
   runDispatch({ action, env, sessionId, options, deps });
