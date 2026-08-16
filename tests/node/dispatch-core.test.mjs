@@ -31,9 +31,31 @@ test('planHolder: wsl WITHOUT interop -> null (benign no-op)', () => {
   assert.equal(planHolder({ env: 'wsl', sessionId: 'AAA', keepDisplay: false, maxHours: 8, holderBody: HOLDER_BODY, interopAvailable: false }), null);
 });
 
-test('planHolder: darwin and linux -> null (not yet implemented)', () => {
+test('planHolder: darwin -> null (not yet implemented)', () => {
   assert.equal(planHolder({ env: 'darwin', sessionId: 'AAA', keepDisplay: false, maxHours: 8, holderBody: HOLDER_BODY }), null);
-  assert.equal(planHolder({ env: 'linux', sessionId: 'AAA', keepDisplay: false, maxHours: 8, holderBody: HOLDER_BODY }), null);
+});
+
+test('planHolder: linux -> the resolved inhibitor holding an idle inhibition', () => {
+  const inv = planHolder({
+    env: 'linux',
+    sessionId: 'AAA',
+    keepDisplay: false,
+    maxHours: 8,
+    holderBody: HOLDER_BODY,
+    resolveBin: (n) => (n === 'systemd-inhibit' ? '/usr/bin/systemd-inhibit' : null),
+    lidPath: null,
+  });
+  assert.equal(inv.command, '/usr/bin/systemd-inhibit');
+  assert.ok(inv.args.includes('--what=idle'));
+  assert.ok(inv.args.includes('--why=Claude Code keep-awake (session AAA)'));
+  assert.deepEqual(inv.args.slice(-2), ['sleep', '28800']);
+});
+
+test('planHolder: linux with no inhibit backend installed -> null (benign no-op)', () => {
+  assert.equal(
+    planHolder({ env: 'linux', sessionId: 'AAA', keepDisplay: false, maxHours: 8, holderBody: HOLDER_BODY, resolveBin: () => null, lidPath: null }),
+    null,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -151,12 +173,29 @@ test('unblock when nothing is running is a harmless no-op', () => {
   assert.equal(h.kills.length, 0);
 });
 
-test('block on an unsupported backend (linux) is a no-op: no spawn, no lock', () => {
+test('block on an unsupported backend (darwin) is a no-op: no spawn, no lock', () => {
   const h = harness();
-  const r = runDispatch({ action: 'block', env: 'linux', sessionId: 'AAA', options: baseOpts, deps: h.deps });
+  const r = runDispatch({ action: 'block', env: 'darwin', sessionId: 'AAA', options: baseOpts, deps: h.deps });
   assert.equal(r.result, 'noop');
   assert.equal(h.spawns.length, 0);
   assert.equal(h.deps.store.read('AAA'), null);
+});
+
+test('block on linux with no inhibit backend is a no-op', () => {
+  const h = harness();
+  const r = runDispatch({ action: 'block', env: 'linux', sessionId: 'AAA', options: baseOpts, deps: { ...h.deps, resolveBin: () => null } });
+  assert.equal(r.result, 'noop');
+  assert.equal(h.spawns.length, 0);
+});
+
+test('block on linux with systemd-inhibit spawns the holder and records the platform', () => {
+  const h = harness();
+  const deps = { ...h.deps, resolveBin: (n) => (n === 'systemd-inhibit' ? '/usr/bin/systemd-inhibit' : null), lidPath: null };
+  const r = runDispatch({ action: 'block', env: 'linux', sessionId: 'AAA', options: baseOpts, deps });
+  assert.equal(r.result, 'started');
+  assert.equal(h.spawns.length, 1);
+  assert.equal(h.spawns[0].command, '/usr/bin/systemd-inhibit');
+  assert.equal(h.deps.store.read('AAA').platform, 'linux');
 });
 
 test('block on wsl without interop is a no-op', () => {
