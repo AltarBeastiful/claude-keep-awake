@@ -21,6 +21,28 @@ All notable changes to this project are documented here. This project adheres to
   integration test that launches a real inhibitor and confirms the group kill releases it; it
   skips itself when no systemd/elogind binary is present.
 
+- **Hold the machine awake through background work that outlives the turn.** `Stop` fires when
+  the turn ends, which is not the same thing as the session being idle: a backgrounded shell
+  (`run_in_background`), subagent, monitor or workflow keeps running past it, and the release was
+  unconditional. Measured on Plasma 6: a background shell ran for ~39s with no inhibitor held at
+  all, the machine free to idle-sleep the whole time. That failure could not self-heal either --
+  sleeping suspends the very task whose completion notification would have re-armed the holder,
+  so the session stays down until a human touches it.
+
+  Claude Code's `Stop` payload already carries the signal: `background_tasks`, documented as
+  "In-flight background work (running/pending + backgrounded) registered in this session. Lets
+  hooks distinguish 'session is done' from 'session is paused waiting for background work to wake
+  it'." `unblock` now defers when that array has a live entry, and a later `Stop` with nothing in
+  flight does the release. Statuses are `pending | running | completed | failed | killed |
+  paused`; anything unrecognized counts as in flight, so an unknown value errs toward staying
+  awake rather than sleeping mid-task.
+
+  `SessionEnd` still releases unconditionally -- the session is gone, so nothing would ever come
+  back to do it -- and an older Claude Code that omits the field releases exactly as before.
+- **`tests/node/background.test.mjs`**: the status matrix, absent/malformed payloads, the
+  `SessionEnd`-always-releases rule, and log-line sanitization (a task description cannot forge
+  a `keep-awake:` line).
+
 ### Changed
 - **`keep_display_on`'s config-dialog description is now platform-accurate.** It previously
   read "Also keep the monitor lit ... the screen may still dim/turn off" on every platform,

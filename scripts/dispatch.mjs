@@ -37,6 +37,9 @@ import {
   parseInhibitList,
   isIdleBlocked,
   parseProcStartTime,
+  parseHookInput,
+  shouldDeferRelease,
+  summarizeBackgroundTasks,
   LINUX_INHIBIT_WHO,
 } from './lib/core.mjs';
 import { runDispatch } from './lib/dispatch-core.mjs';
@@ -311,7 +314,8 @@ function main() {
     return;
   }
 
-  const sessionId = sessionIdFromHookInput(readStdin());
+  const raw = readStdin();
+  const sessionId = sessionIdFromHookInput(raw);
 
   const options = {
     keepDisplay: toBoolFlag(process.env.CLAUDE_PLUGIN_OPTION_KEEP_DISPLAY_ON, false),
@@ -331,6 +335,18 @@ function main() {
     interopAvailable: env === 'wsl' ? isInteropAvailable({ readFileText }) : false,
     resolveBin,
   };
+
+  // `Stop` fires when the turn ends, which is not the same thing as the session being idle: a
+  // backgrounded shell or subagent keeps running past it. Hold the existing holder in that case
+  // and let a later Stop (or SessionEnd) release it.
+  if (action === 'unblock') {
+    const { defer, tasks } = shouldDeferRelease(parseHookInput(raw));
+    if (defer) {
+      deps.store.touch(sessionId);
+      deps.log(`keep-awake: holding through Stop -- ${tasks.length} background task(s) in flight: ${summarizeBackgroundTasks(tasks)}`);
+      return;
+    }
+  }
 
   runDispatch({ action, env, sessionId, options, deps });
 }

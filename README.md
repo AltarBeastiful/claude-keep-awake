@@ -109,9 +109,16 @@ The block is held only while a turn is actively running:
 
 - **Claude is working** (thinking, running commands, including long-running commands and
   subagents) — the system stays awake.
-- **The turn finishes and Claude is waiting for your next prompt** — the holder is released
-  (on `Stop`), so your machine sleeps normally. Nothing to do; this is automatic, so walking
-  away after Claude is done does *not* keep the machine up.
+- **The turn finishes with nothing left in flight** — the holder is released (on `Stop`), so
+  your machine sleeps normally. Nothing to do; this is automatic, so walking away after Claude
+  is done does *not* keep the machine up.
+- **The turn finishes but background work is still running** — a backgrounded shell
+  (`run_in_background`), subagent, monitor or workflow — the machine **stays awake**. `Stop`
+  reports that work in `background_tasks`, so the release is deferred until a later `Stop` finds
+  nothing in flight. Without this the machine could idle-sleep in the middle of a background
+  build, and it could not recover on its own: sleeping suspends the very task whose completion
+  notification would have re-armed the holder. `SessionEnd` always releases regardless — once
+  the session is gone nothing would ever come back to do it.
 - **Claude is paused mid-turn waiting for you to approve a permission prompt** — the machine
   **stays awake** while the prompt is pending. This is deliberate: Claude Code fires no hook
   at the instant you approve, and a pending permission prompt is indistinguishable from a

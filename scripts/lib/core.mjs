@@ -64,6 +64,79 @@ export function sessionIdFromHookInput(raw) {
   }
 }
 
+// Parse the hook stdin JSON. Returns null on empty or unparseable input (e.g. a manual run
+// outside a hook), which every caller below treats as "no information".
+export function parseHookInput(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    // A hook payload is always a JSON object; an array or scalar is not one.
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Background work outliving the turn
+// ---------------------------------------------------------------------------
+
+// Task statuses that mean the work is over. Claude Code's vocabulary is
+// pending | running | completed | failed | killed | paused; the first, second and last are all
+// still in flight. Anything unrecognized (a status a future version adds) counts as in flight
+// too, so the unknown case errs toward staying awake -- the same bias as the pending-permission
+// case in the README.
+export const TERMINAL_TASK_STATUSES = ['completed', 'failed', 'killed'];
+
+// The in-flight subset of a Stop payload's `background_tasks`.
+//
+// Claude Code documents the field as: "In-flight background work (running/pending +
+// backgrounded) registered in this session. Lets hooks distinguish 'session is done' from
+// 'session is paused waiting for background work to wake it'. Empty array when nothing is in
+// flight." Entries are { id, type, status, description, command?, agent_type?, server?, tool?,
+// name? }, where `type` is a friendly label: 'shell', 'subagent', 'monitor', 'workflow'.
+//
+// A missing field (an older Claude Code that does not send it) yields [], so the release path
+// behaves exactly as it did before this signal existed.
+export function inFlightBackgroundTasks(input) {
+  const tasks = input && Array.isArray(input.background_tasks) ? input.background_tasks : [];
+  return tasks.filter((t) => {
+    if (!t || typeof t !== 'object') return false;
+    return !TERMINAL_TASK_STATUSES.includes(String(t.status ?? '').trim().toLowerCase());
+  });
+}
+
+// One-line, log-safe summary of in-flight tasks: "shell(running): npm test, subagent(running)".
+// Newlines are collapsed so a task description can never forge extra log lines.
+export function summarizeBackgroundTasks(tasks, { max = 3 } = {}) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  const shown = list.slice(0, max).map((t) => {
+    const type = String(t.type ?? 'task').replace(/\s+/g, ' ').trim() || 'task';
+    const status = String(t.status ?? '?').replace(/\s+/g, ' ').trim() || '?';
+    const what = String(t.command ?? t.description ?? '').replace(/\s+/g, ' ').trim();
+    return `${type}(${status})${what ? `: ${what.slice(0, 60)}` : ''}`;
+  });
+  if (list.length > shown.length) shown.push(`+${list.length - shown.length} more`);
+  return shown.join(', ');
+}
+
+// Decide whether an `unblock` should be deferred instead of performed.
+//
+// A turn ending is not the same thing as the session being idle. A backgrounded shell or
+// subagent outlives the turn, so releasing on `Stop` lets the machine idle-sleep in the middle
+// of it -- and that cannot self-heal, because the sleeping machine suspends the very task whose
+// completion notification would have re-armed the holder.
+//
+// Only `Stop` defers. `SessionEnd` must always release: the session is gone, so nothing will
+// ever come back to release it. An absent or unrecognized `hook_event_name` also releases,
+// preserving the previous behavior. The max-lifetime backstop stays the final ceiling, and the
+// stale-lock sweep in `block` still reaps a holder whose process died.
+export function shouldDeferRelease(input) {
+  if (!input || input.hook_event_name !== 'Stop') return { defer: false, tasks: [] };
+  const tasks = inFlightBackgroundTasks(input);
+  return { defer: tasks.length > 0, tasks };
+}
+
 // ---------------------------------------------------------------------------
 // Status reporting (cross-platform /keep-awake-status)
 // ---------------------------------------------------------------------------
