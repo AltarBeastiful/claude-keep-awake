@@ -88,6 +88,20 @@ first kind.
 display-off, and on Plasma it also suppresses the screen lock. The option still tags the reason
 string, so `systemd-inhibit --list` shows what the session asked for.
 
+The reason string names the session, so `--list` tells you which window is holding the machine
+awake rather than only that something is:
+
+```
+WHO          PID      WHAT  WHY                                    MODE
+Claude Code  3552102  idle  Working on Test something (c4b94408)    block
+```
+
+The name is the one `/status` shows, followed by a short session id in the style of a git short
+SHA. The full id stays on the lock file and in `/keep-awake-status`. The name comes from the
+transcript and Claude Code assigns it after the first exchange, so the opening turn of a new
+session shows `Working on session c4b94408` instead. Note that the reason string is readable by
+every user on the machine, and a session name is derived from what you typed.
+
 ### Robustness
 
 - **Idempotent:** re-prompting in a session that already has a live holder just refreshes the
@@ -181,8 +195,8 @@ node "<plugin-root>/scripts/dispatch.mjs" status
 
 It reports the detected environment, a `System sleep blocked : True/False` verdict (the
 Windows **host** state on WSL2, the live `--list` verdict on Linux), whether the display is
-being kept on, and any active holders with their session id, platform, PID, and liveness. On
-Linux it also names the resolved backend. The decisive test is differential —
+being kept on, and any active holders with their session name, session id, platform, PID, and
+liveness. On Linux it also names the resolved backend. The decisive test is differential —
 submit a prompt and you should see `True` while Claude works, returning to `False` after the
 turn ends.
 

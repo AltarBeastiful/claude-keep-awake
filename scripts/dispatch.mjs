@@ -13,7 +13,7 @@
 // never emit a blocking decision. A missing `node`, missing `powershell.exe`, disabled WSL
 // interop, or an unsupported OS all degrade to a benign no-op.
 
-import { readFileSync, writeFileSync, unlinkSync, readdirSync, mkdirSync, utimesSync, accessSync, constants } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, readdirSync, mkdirSync, utimesSync, accessSync, openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -22,6 +22,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   detectEnvironment,
   isInteropAvailable,
+  extractSessionTitle,
   sessionIdFromHookInput,
   toBoolFlag,
   toLifetimeHours,
@@ -64,6 +65,37 @@ function readStdin() {
     return readFileSync(0, 'utf-8');
   } catch {
     return '';
+  }
+}
+
+// How much of a transcript's tail to scan for the session name. Claude Code re-emits the
+// ai-title record on every re-title, so the newest one sits near the end: measured at 21-22 KB
+// from EOF on 1.5 MB and 2.6 MB transcripts. 256 KB is an order of magnitude of headroom while
+// keeping a hook off the path of reading a multi-megabyte file.
+const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
+
+// Read the last chunk of the transcript, or null if anything at all goes wrong. The path comes
+// from the hook payload (`transcript_path`, present on both UserPromptSubmit and Stop), so it is
+// not ours to trust: absence, permissions and races all have to degrade to "no name".
+function readTranscriptTail(path, bytes = TRANSCRIPT_TAIL_BYTES) {
+  if (!path || typeof path !== 'string') return null;
+  let fd = null;
+  try {
+    fd = openSync(path, 'r');
+    const { size } = fstatSync(fd);
+    const length = Math.min(size, bytes);
+    if (length <= 0) return null;
+    const buf = Buffer.alloc(length);
+    readSync(fd, buf, 0, length, size - length);
+    return buf.toString('utf-8');
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch { /* ignore */ }
+    }
   }
 }
 
@@ -316,6 +348,7 @@ function main() {
 
   const raw = readStdin();
   const sessionId = sessionIdFromHookInput(raw);
+  const input = parseHookInput(raw);
 
   const options = {
     keepDisplay: toBoolFlag(process.env.CLAUDE_PLUGIN_OPTION_KEEP_DISPLAY_ON, false),
@@ -332,6 +365,8 @@ function main() {
     now: () => new Date(),
     log: (msg) => { try { process.stderr.write(`${msg}\n`); } catch { /* ignore */ } },
     holderBody: readFileText(join(HERE, 'windows', 'holder.ps1')) ?? '',
+    // Called only when a holder is actually about to launch (see dispatch-core's block()).
+    readSessionTitle: () => extractSessionTitle(readTranscriptTail(input && input.transcript_path)),
     interopAvailable: env === 'wsl' ? isInteropAvailable({ readFileText }) : false,
     resolveBin,
   };
@@ -340,7 +375,7 @@ function main() {
   // backgrounded shell or subagent keeps running past it. Hold the existing holder in that case
   // and let a later Stop (or SessionEnd) release it.
   if (action === 'unblock') {
-    const { defer, tasks } = shouldDeferRelease(parseHookInput(raw));
+    const { defer, tasks } = shouldDeferRelease(input);
     if (defer) {
       deps.store.touch(sessionId);
       deps.log(`keep-awake: holding through Stop -- ${tasks.length} background task(s) in flight: ${summarizeBackgroundTasks(tasks)}`);

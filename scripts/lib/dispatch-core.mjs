@@ -21,13 +21,13 @@ import {
 //   linux          -> systemd-inhibit / elogind-inhibit / gnome-session-inhibit holding an
 //                     idle inhibition, or null when none of them is installed
 //   darwin         -> null  (native backend not implemented yet; detected but no-op)
-export function planHolder({ env, sessionId, keepDisplay, maxHours, holderBody, interopAvailable, resolveBin }) {
+export function planHolder({ env, sessionId, sessionTitle, keepDisplay, maxHours, holderBody, interopAvailable, resolveBin }) {
   if (env === 'linux') {
     const inhibitor = resolveLinuxInhibitor({ resolveBin });
     if (!inhibitor) return null;
     return buildLinuxHolderInvocation({
       inhibitor,
-      reason: buildLinuxReason({ sessionId, keepDisplay }),
+      reason: buildLinuxReason({ sessionId, sessionTitle, keepDisplay }),
       maxHours,
     });
   }
@@ -35,7 +35,7 @@ export function planHolder({ env, sessionId, keepDisplay, maxHours, holderBody, 
   if (env === 'wsl' && !interopAvailable) return null;
   if (env !== 'win32' && env !== 'wsl') return null;
 
-  const reason = buildReason({ sessionId, keepDisplay });
+  const reason = buildReason({ sessionId, sessionTitle, keepDisplay });
   const prelude = buildHolderPrelude({ reason, keepDisplay, maxHours });
   const script = prelude + holderBody;
   return buildPowerShellHolderInvocation({ script });
@@ -76,9 +76,14 @@ function block({ env, sessionId, options, deps }) {
   }
 
   // 3) Pick a holder for this environment; null means there is nothing useful to run here.
+  //    The session name is resolved lazily, here and not earlier, because reading it means
+  //    touching the transcript file: every turn after the first takes the idempotent path above
+  //    and never gets this far, so the common case pays nothing for it.
+  const sessionTitle = typeof deps.readSessionTitle === 'function' ? deps.readSessionTitle() : '';
   const invocation = planHolder({
     env,
     sessionId,
+    sessionTitle,
     keepDisplay: options.keepDisplay,
     maxHours: options.maxHours,
     holderBody: deps.holderBody,
@@ -103,6 +108,9 @@ function block({ env, sessionId, options, deps }) {
   //    holder's process start time) is the PID-reuse-safe identity unblock verifies before
   //    killing.
   const record = { pid: launched.pid, platform: env, startedAt: deps.now().toISOString(), procStart: launched.procStart };
+  // Recorded so `/keep-awake-status` can name the session too, and so it stays the name the
+  // holder actually registered under even after the session is re-titled.
+  if (sessionTitle) record.title = sessionTitle;
   deps.store.write(sessionId, record);
   return { result: 'started', pid: launched.pid };
 }

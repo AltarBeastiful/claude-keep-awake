@@ -43,6 +43,37 @@ All notable changes to this project are documented here. This project adheres to
   `SessionEnd`-always-releases rule, and log-line sanitization (a task description cannot forge
   a `keep-awake:` line).
 
+- **The inhibit reason now names the session, not just its id.** `systemd-inhibit --list` used
+  to read `Working on session c4b94408-3b66-4843-8d0f-a9ab78500c53`, which identifies the
+  session precisely and tells you nothing about which window to go and look at -- the only
+  question you have when two or three sessions are holding at once. It now leads with the
+  session name and carries a short id after it, reading like a git log line:
+
+  ```
+  Working on Test something (c4b94408)
+  ```
+
+  The id is shortened the way git shortens a SHA: 36 characters of a one-line status field went
+  on something nobody types out, and the first UUID segment is already enough to tell two
+  sessions apart. The full id is still on the lock file and in `/keep-awake-status`. Nothing
+  matches on this string (`status` counts our inhibitors by holder PID and `WHO`), so it is
+  cosmetic by construction.
+
+  The name comes from the `ai-title` record in the session transcript, reached via the
+  `transcript_path` both hook payloads carry. Claude Code assigns it after the first exchange,
+  so the first turn of a brand-new session has no name to show and prints exactly the string it
+  always did. The name is read lazily, only when a holder is actually about to launch, so the
+  idempotent path that every later turn takes never touches the file; and only the last 256 KB
+  of the transcript is scanned (the record sits ~21 KB from EOF in practice). Windows gets the
+  same treatment in `powercfg /requests`, and `/keep-awake-status` reports the name too.
+
+  A name is model-authored text landing in a world-readable system string, so it is flattened to
+  one line and capped at 60 characters.
+- **`tests/node/session-name.test.mjs`**: transcript parsing (last record wins, truncated tail
+  lines, decoy records), sanitization, both reason builders with and without a name, the argv
+  wiring, and the assertion that the transcript is read once per holder rather than once per
+  turn.
+
 ### Changed
 - **`keep_display_on`'s config-dialog description is now platform-accurate.** It previously
   read "Also keep the monitor lit ... the screen may still dim/turn off" on every platform,

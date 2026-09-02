@@ -183,7 +183,10 @@ export function formatStatusReport({ env, state, locks, now }) {
   } else {
     for (const l of locks) {
       const r = l.record || {};
-      lines.push(`  session ${l.sessionId}  platform ${r.platform ?? '?'}  pid ${r.pid ?? '?'}  alive ${l.alive ? 'True' : 'False'}  (started ${r.startedAt ?? '?'})`);
+      // The name is recorded at holder launch, so a session blocked before it was titled shows
+      // the id alone -- the same line this printed before names were carried at all.
+      const name = sanitizeReasonLabel(r.title);
+      lines.push(`  session ${l.sessionId}${name ? `  name ${name}` : ''}  platform ${r.platform ?? '?'}  pid ${r.pid ?? '?'}  alive ${l.alive ? 'True' : 'False'}  (started ${r.startedAt ?? '?'})`);
     }
   }
   return lines.join('\n');
@@ -252,12 +255,79 @@ export function parseLock(text) {
 }
 
 // ---------------------------------------------------------------------------
+// Session name (the "Session name" line `/status` prints, e.g. "Test something")
+// ---------------------------------------------------------------------------
+
+// A reason string is world-readable (`systemd-inhibit --list`, `powercfg /requests`) and lands
+// in a process argv, and a session name is model-authored text, so treat it as untrusted:
+// flatten control characters and newlines to spaces and cap the length so `--list` output stays
+// one readable line. Returns '' for anything unusable, which callers read as "no name".
+export const MAX_SESSION_TITLE = 60;
+
+export function sanitizeReasonLabel(value, { max = MAX_SESSION_TITLE } = {}) {
+  const flat = String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!flat) return '';
+  return flat.length > max ? `${flat.slice(0, max).trimEnd()}...` : flat;
+}
+
+// Session ids are UUIDs, and a full one costs 36 characters of a one-line status field to say
+// something the reader never types out. Shorten it the way git shortens a SHA: enough to tell
+// two sessions apart at a glance, with the full id still on the lock file and in
+// `/keep-awake-status` when you actually need it. UUIDs are hyphen-segmented and the first
+// segment is exactly 8, so this is a clean cut rather than an arbitrary one; the cap also keeps
+// a non-UUID id (the 'default' fallback, a test id) from running long.
+export const SHORT_SESSION_ID_LENGTH = 8;
+
+export function shortSessionId(sessionId, { length = SHORT_SESSION_ID_LENGTH } = {}) {
+  const id = String(sessionId ?? '').trim();
+  if (!id) return '';
+  return id.split('-')[0].slice(0, length);
+}
+
+// Claude Code stores the session name in the session transcript as its own record type, and
+// re-emits it whenever the session is re-titled, so the LAST one wins:
+//
+//   {"type":"ai-title","aiTitle":"Test something","sessionId":"c4b94408-..."}
+//
+// Pure: the caller supplies the text. dispatch.mjs passes only the tail of the transcript --
+// these files routinely run to megabytes and this is on a hook's hot path -- which means the
+// first line of the chunk is usually a fragment. A fragment simply fails to parse and is
+// skipped, so no special casing is needed.
+export function extractSessionTitle(chunk) {
+  if (!chunk) return '';
+  let title = '';
+  for (const line of String(chunk).split('\n')) {
+    // Cheap reject before paying for JSON.parse on every transcript line.
+    if (!line.includes('"ai-title"')) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!record || typeof record !== 'object' || record.type !== 'ai-title') continue;
+    const cleaned = sanitizeReasonLabel(record.aiTitle);
+    if (cleaned) title = cleaned;
+  }
+  return title;
+}
+
+// ---------------------------------------------------------------------------
 // PowerShell holder construction (shared by win32 + wsl, delivered via -EncodedCommand)
 // ---------------------------------------------------------------------------
 
 // The human-readable reason string surfaced by Windows power tooling (powercfg /requests).
-export function buildReason({ sessionId, keepDisplay }) {
-  let reason = `Claude Code keep-awake (session ${sessionId})`;
+// Carries the session NAME and its id, the same pair `/status` shows, because the id alone
+// answers "which session" precisely and "which window do I go and look at" not at all.
+export function buildReason({ sessionId, sessionTitle, keepDisplay }) {
+  const name = sanitizeReasonLabel(sessionTitle);
+  const short = shortSessionId(sessionId);
+  let reason = name
+    ? `Claude Code keep-awake: ${name} (${short})`
+    : `Claude Code keep-awake (session ${short})`;
   if (keepDisplay) reason += ' [display]';
   return reason;
 }
@@ -354,8 +424,18 @@ export const LINUX_INHIBIT_WHO = 'Claude Code';
 // The WHY field. Desktop UIs render an inhibition as "<WHO> is blocking screen locking.
 // (<WHY>)" -- Plasma's battery applet does exactly this -- so WHY reads as a continuation of
 // WHO rather than repeating it, the way vlc reports "Playing some media.".
-export function buildLinuxReason({ sessionId, keepDisplay }) {
-  return `Working on session ${sessionId}${keepDisplay ? ' [display]' : ''}`;
+//
+// It leads with the session NAME and carries a short id after it, the way a git log line reads
+// as a subject plus a short SHA. With two or three sessions held at once the full id says which
+// session precisely and tells you nothing about which window to go and look at, which is the
+// only question you have when you read this list. The name is absent for the first turn of a
+// brand-new session (Claude Code assigns it after the first exchange), and then this falls back
+// to the id alone.
+export function buildLinuxReason({ sessionId, sessionTitle, keepDisplay }) {
+  const name = sanitizeReasonLabel(sessionTitle);
+  const short = shortSessionId(sessionId);
+  const base = name ? `Working on ${name} (${short})` : `Working on session ${short}`;
+  return `${base}${keepDisplay ? ' [display]' : ''}`;
 }
 
 // Inhibit backends in preference order. All three take "hold this inhibition for as long as
